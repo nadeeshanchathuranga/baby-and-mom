@@ -7,6 +7,7 @@ use App\Models\Size;
 use App\Models\Color;
 use App\Models\Category;
 use App\Models\Product;
+use App\Models\PromotionItem;
 use App\Models\Supplier;
 use App\Models\StockTransaction;
 use App\Traits\GeneratesUniqueCode;
@@ -17,6 +18,7 @@ use Inertia\Inertia;
 use Carbon\Carbon;
 use Illuminate\Validation\Rule;
 use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 
@@ -36,7 +38,7 @@ class ProductController extends Controller
             'categories' => $allcategories
         ]);
     }
-  
+
 
 
 public function fetchProducts(Request $request)
@@ -521,95 +523,133 @@ public function fetchProducts(Request $request)
 
 
     public function update(Request $request, Product $product)
-    {
-        if (!Gate::allows('hasRole', ['Admin'])) {
-            abort(403, 'Unauthorized');
-        }
-
-        try {
-            $validated = $request->validate([
-                'category_id' => 'nullable|exists:categories,id',
-                'name' => 'required|string|max:255',
-                'size_id' => 'nullable|exists:sizes,id',
-                'color_id' => 'nullable|exists:colors,id',
-                'cost_price' => 'required|numeric|min:0',
-                'selling_price' => 'required|numeric|min:0',
-                'discounted_price' => 'nullable|numeric|min:0',
-                'discount' => 'nullable|numeric|min:0|max:100',
-                'stock_quantity' => 'required|integer|min:0',
-
-                'image' => 'nullable|image|max:2048',
-                'certificate' => 'nullable|file|mimes:pdf,jpg,jpeg,png|max:2048',
-                'expire_date' => 'nullable|date',
-                'expiry_date_margin' => 'nullable|integer|min:0',
-                'preorder_level_qty' => 'nullable|integer|min:0',
-                'batch_no' => 'nullable|string|max:50',
-                'purchase_date' => 'nullable|date',
-                'whole_price' => 'nullable|numeric|min:0',
-                'final_whole_price' => 'nullable|numeric|min:0',
-                'wholesale_discount' => 'nullable|numeric|min:0|max:100',
-                'code' => 'nullable|max:50',
-            ]);
-
-            // Handle image upload
-            if ($request->hasFile('image')) {
-                if ($product->image && Storage::disk('public')->exists(str_replace('storage/', '', $product->image))) {
-                    Storage::disk('public')->delete(str_replace('storage/', '', $product->image));
-                }
-
-                $fileName = 'product_' . now()->format('YmdHis') . '.' . $request->file('image')->getClientOriginalExtension();
-                $path = $request->file('image')->storeAs('products', $fileName, 'public');
-                $validated['image'] = 'storage/' . $path;
-            } else {
-                $validated['image'] = $product->image;
-            }
-
-            // Handle certificate upload
-            if ($request->hasFile('certificate')) {
-                if ($product->certificate_path && Storage::disk('public')->exists($product->certificate_path)) {
-                    Storage::disk('public')->delete($product->certificate_path);
-                }
-
-                $certificatePath = $request->file('certificate')->store('certificates', 'public');
-                $validated['certificate_path'] = $certificatePath;
-            } else {
-                $validated['certificate_path'] = $product->certificate_path;
-            }
-
-            // Calculate stock change
-            $newQuantity = $validated['stock_quantity'] ?? $product->stock_quantity;
-            $stockChange = $newQuantity - $product->stock_quantity;
-            $validated['total_quantity'] = $newQuantity;
-
-            // Update product
-            $product->update($validated);
-
-            // Log stock change if needed
-            if ($stockChange !== 0) {
-                $transactionType = $stockChange > 0 ? 'Added' : 'Deducted';
-
-                StockTransaction::create([
-                    'product_id' => $product->id,
-                    'transaction_type' => $transactionType,
-                    'quantity' => abs($stockChange),
-                    'transaction_date' => now(),
-                    'supplier_id' => $validated['supplier_id'] ?? null,
-                ]);
-            }
-
-            return redirect()->route('products.index')->with('banner', 'Product updated successfully');
-
-        } catch (\Throwable $e) {
-
-
-            Log::error('Product update failed', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString(),
-            ]);
-
-            return back()->withErrors(['error' => 'Product update failed. Please try again.']);
-        }
+{
+    if (!Gate::allows('hasRole', ['Admin'])) {
+        abort(403, 'Unauthorized');
     }
+
+    try {
+        // Build rules, validate files only if newly uploaded
+        $rules = [
+            'category_id'         => 'nullable|exists:categories,id',
+            'supplier_id'         => 'nullable|exists:suppliers,id',
+            'name'                => 'required|string|max:255',
+            'size_id'             => 'nullable|exists:sizes,id',
+            'color_id'            => 'nullable|exists:colors,id',
+            'cost_price'          => 'required|numeric|min:0',
+            'selling_price'       => 'required|numeric|min:0',
+            'discounted_price'    => 'nullable|numeric|min:0',
+            'discount'            => 'nullable|numeric|min:0|max:100',
+            'stock_quantity'      => 'required|integer|min:0',
+            'expire_date'         => 'nullable|date',
+            'expiry_date_margin'  => 'nullable|integer|min:0',
+            'preorder_level_qty'  => 'nullable|integer|min:0',
+            'batch_no'            => 'nullable|string|max:50',
+            'purchase_date'       => 'nullable|date',
+            'whole_price'         => 'nullable|numeric|min:0',
+            'final_whole_price'   => 'nullable|numeric|min:0',
+            'wholesale_discount'  => 'nullable|numeric|min:0|max:100',
+            'code'                => 'nullable|max:50',
+        ];
+
+        // Only enforce "image" rule when a new image is uploaded
+        $rules['image'] = $request->hasFile('image')
+            ? 'image|mimes:jpg,jpeg,png,bmp,webp|max:2048'
+            : 'nullable|string';
+
+        // Only enforce "file" rule when a new certificate is uploaded
+        $rules['certificate'] = $request->hasFile('certificate')
+            ? 'file|mimes:pdf,jpg,jpeg,png|max:2048'
+            : 'nullable|string';
+
+        $validated = $request->validate($rules);
+
+        DB::beginTransaction();
+
+        /*-------------------------------------------------
+         | IMAGE UPLOAD (public disk) + delete old file
+         *------------------------------------------------*/
+        if ($request->hasFile('image')) {
+            // delete old if exists
+            $oldImagePath = $product->image ? str_replace('storage/', '', $product->image) : null;
+            if ($oldImagePath && Storage::disk('public')->exists($oldImagePath)) {
+                Storage::disk('public')->delete($oldImagePath);
+            }
+
+            $fileName = 'product_' . now()->format('YmdHis') . '.' . $request->file('image')->getClientOriginalExtension();
+            $path = $request->file('image')->storeAs('products', $fileName, 'public');
+            // save as "storage/..." so it's web accessible via symlink
+            $validated['image'] = 'storage/' . $path;
+        } else {
+            // keep the previous image path
+            $validated['image'] = $product->image;
+        }
+
+        /*-------------------------------------------------
+         | CERTIFICATE UPLOAD (public disk) + delete old
+         *------------------------------------------------*/
+        if ($request->hasFile('certificate')) {
+            $oldCertPath = $product->certificate_path ?: null;
+            if ($oldCertPath && Storage::disk('public')->exists($oldCertPath)) {
+                Storage::disk('public')->delete($oldCertPath);
+            }
+
+            $certificatePath = $request->file('certificate')->store('certificates', 'public');
+            $validated['certificate_path'] = $certificatePath;
+        } else {
+            $validated['certificate_path'] = $product->certificate_path;
+        }
+
+        /*-------------------------------------------------
+         | STOCK & TOTAL QUANTITY
+         *------------------------------------------------*/
+        $newQuantity = $validated['stock_quantity'] ?? $product->stock_quantity;
+        $stockChange = (int)$newQuantity - (int)$product->stock_quantity;
+
+        // keep total_quantity in sync with the new stock count (if that's your logic)
+        $validated['total_quantity'] = $newQuantity;
+
+        /*-------------------------------------------------
+         | UPDATE PRODUCT
+         *------------------------------------------------*/
+        $product->update($validated);
+
+        /*-------------------------------------------------
+         | STOCK TRANSACTION (only if stock changed)
+         *------------------------------------------------*/
+        if ($stockChange !== 0) {
+            $transactionType = $stockChange > 0 ? 'Added' : 'Deducted';
+
+            StockTransaction::create([
+                'product_id'       => $product->id,
+                'transaction_type' => $transactionType,
+                'quantity'         => abs($stockChange),
+                'transaction_date' => now(),
+                'supplier_id'      => $validated['supplier_id'] ?? null,
+            ]);
+        }
+
+        DB::commit();
+
+        return redirect()
+            ->route('products.index')
+            ->with('banner', 'Product updated successfully');
+
+    } catch (\Throwable $e) {
+        DB::rollBack();
+
+        Log::error('Product update failed', [
+            'product_id' => $product->id ?? null,
+            'error'      => $e->getMessage(),
+            // comment the trace in production if too noisy
+            'trace'      => $e->getTraceAsString(),
+        ]);
+
+        return back()->withErrors([
+            'error' => 'Product update failed. Please try again.',
+        ])->withInput();
+    }
+}
 
 
 
@@ -725,6 +765,155 @@ public function fetchProducts(Request $request)
 
         return back()->with('success', 'CSV uploaded and products saved successfully.');
     }
+
+
+
+
+
+
+
+ public function getPromotionItems($productId)
+    {
+        // Fetch promotion items where promotion_id equals $productId
+        $promotionItems = PromotionItem::where('promotion_id', $productId)
+            ->with('product') // Include related product details
+            ->get();
+
+        // Check if any promotion items are found
+        if ($promotionItems->isEmpty()) {
+            return response()->json(['error' => 'No promotion items found for this promotion ID.'], 404);
+        }
+
+        return response()->json([
+            'promotion_items' => $promotionItems,
+        ]);
+    }
+
+
+
+
+  public function addPromotion(Request $request)
+    {
+        $allcategories = Category::with('parent')->get()->map(function ($category) {
+            $category->hierarchy_string = $category->hierarchy_string; // Access it
+            return $category;
+        });
+        $colors = Color::orderBy('created_at', 'desc')->get();
+        $sizes = Size::orderBy('created_at', 'desc')->get();
+
+
+        return Inertia::render('Products/Promotions', [
+            'allcategories' => $allcategories,
+            'colors' => $colors,
+            'sizes' => $sizes,
+        ]);
+    }
+
+    
+
+
+
+
+ public function submitPromotion(Request $request)
+{
+    if (!Gate::allows('hasRole', ['Admin'])) {
+        abort(403, 'Unauthorized');
+    }
+
+    $validated = $request->validate([
+        'category_id'       => 'required|exists:categories,id',
+        'name'              => 'required|string|max:255',
+        'size_id'           => 'nullable|exists:sizes,id',
+        'color_id'          => 'nullable|exists:colors,id',
+        'cost_price'        => 'required|numeric|min:0',
+        'selling_price'     => 'required|numeric|min:0',
+        'discounted_price'  => 'nullable|numeric|min:0',
+        'stock_quantity'    => 'required|integer|min:0',
+        'discount'          => 'nullable|numeric|min:0|max:100',
+        'supplier_id'       => 'nullable|exists:suppliers,id',
+        'barcode'           => ['nullable','string',\Illuminate\Validation\Rule::unique('products','barcode')->whereNull('deleted_at')],
+        'image'             => 'nullable|file|image|mimes:jpeg,png,jpg,gif,webp|max:2048',
+        'description'       => 'nullable|string',
+        'products'                 => 'required|array|min:1',
+        'products.*.id'            => 'required|exists:products,id',
+        'products.*.quantity'      => 'required|integer|min:1',
+    ], [
+        'category_id.required' => 'Category is required.',
+        'category_id.exists'   => 'The selected category is invalid.',
+    ]);
+
+    try {
+        return \DB::transaction(function () use ($request, $validated) {
+            $data = $validated;
+
+            if ($request->hasFile('image')) {
+                $ext  = $request->file('image')->getClientOriginalExtension();
+                $name = 'product_' . now()->format('YmdHis') . '.' . $ext;
+                $path = $request->file('image')->storeAs('products', $name, 'public');
+                $data['image'] = 'storage/' . $path;
+            }
+
+            if (empty($data['barcode'])) {
+                $data['barcode'] = $this->generateUniqueCode(12);
+            }
+
+            $items = collect($data['products'])
+                ->groupBy('id')
+                ->map(fn($g) => ['id' => $g->first()['id'], 'quantity' => $g->sum('quantity')])
+                ->values()
+                ->all();
+
+            unset($data['products']);
+
+            foreach ($items as $i) {
+                $p = \App\Models\Product::lockForUpdate()->find($i['id']);
+                if (!$p || $p->stock_quantity < $i['quantity']) {
+                    abort(422, 'Insufficient stock for product ID '.$i['id']);
+                }
+            }
+
+            $data['is_promotion']   = true;
+            $data['total_quantity'] = (int)($data['stock_quantity'] ?? 0);
+
+            $promotion = \App\Models\Product::create($data);
+            $promotion->update(['code' => 'PROD-' . $promotion->id]);
+
+            foreach ($items as $i) {
+                \App\Models\PromotionItem::create([
+                    'product_id'   => $i['id'],
+                    'promotion_id' => $promotion->id,
+                    'quantity'     => (int)$i['quantity'],
+                ]);
+            }
+
+            foreach ($items as $i) {
+                $p = \App\Models\Product::lockForUpdate()->find($i['id']);
+                $p->stock_quantity  = (int)$p->stock_quantity - (int)$i['quantity'];
+                $p->total_quantity  = (int)($p->total_quantity ?? $p->stock_quantity) - (int)$i['quantity'];
+                if ($p->total_quantity < 0) $p->total_quantity = 0;
+                $p->save();
+
+                \App\Models\StockTransaction::create([
+                    'product_id'       => $p->id,
+                    'transaction_type' => 'Deducted',
+                    'quantity'         => (int)$i['quantity'],
+                    'transaction_date' => now(),
+                    'supplier_id'      => $validated['supplier_id'] ?? null,
+                ]);
+            }
+
+            return redirect()->route('products.index')->banner('Promotion created successfully');
+        });
+    } catch (\Throwable $e) {
+        \Log::error('Error creating promotion', ['error' => $e->getMessage()]);
+        return back()->with('error', 'An error occurred while creating the promotion. Please try again.')->withInput();
+    }
+}
+
+
+
+
+
 
 
 }

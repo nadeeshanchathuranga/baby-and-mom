@@ -56,6 +56,11 @@ Route::middleware(['auth', 'verified'])->group(function () {
     Route::resource('grns', GrnController::class);
     Route::post('products-size', [ProductController::class, 'sizeStore'])->name('productSize');
 
+
+      Route::get('/add_promotion', [ProductController::class, 'addPromotion']);
+    Route::post('/submit_promotion', [ProductController::class, 'submitPromotion']);
+    Route::get('/products/{id}/promotion-items', [ProductController::class, 'getPromotionItems']);
+
     Route::get('/company-info', [CompanyInfoController::class, 'index'])->name('companyInfo.index');
     Route::post('/company-info/{companyInfo}', [CompanyInfoController::class, 'update'])->name('companyInfo.update');
 
