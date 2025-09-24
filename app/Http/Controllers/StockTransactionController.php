@@ -15,8 +15,7 @@ class StockTransactionController extends Controller
 
      public function index()
      {
-         $allStockTransactions = StockTransaction::with('product.supplier')->orderBy('created_at', 'desc')->get();
-
+          $allStockTransactions = StockTransaction::with('product.supplier')->orderBy('id', 'desc')->get();
 
          return Inertia::render('StockTransaction/Index', [
              'allStockTransactions' => $allStockTransactions,
@@ -76,7 +75,7 @@ class StockTransactionController extends Controller
 
 
          $Stockreason = StockTransaction::find($request->stock_id);
-       
+
          if ($Stockreason != null)
          {
              $Stockreason->reason = $request->input('reason');

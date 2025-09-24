@@ -87,7 +87,7 @@ public function fetchProducts(Request $request)
         $productsQuery->orderBy('products.selling_price', $sortOrder);
     } else {
         // FIFO: oldest first within each stock group
-        $productsQuery->orderBy('products.created_at', 'asc');
+        $productsQuery->orderBy('products.created_at', 'desc');
     }
 
     $products = $productsQuery->paginate(8);
@@ -809,7 +809,7 @@ public function fetchProducts(Request $request)
         ]);
     }
 
-    
+
 
 
 
